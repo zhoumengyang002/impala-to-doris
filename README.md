@@ -45,7 +45,7 @@ cp -r impala-to-doris/ ~/.claude/skills/
 ### `npx skills` (Skills CLI)
 
 ```bash
-npx skills add github:<your-username>/impala-to-doris
+npx skills add github:zhoumengyang002/impala-to-doris
 ```
 
 ## What's inside
