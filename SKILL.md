@@ -117,8 +117,8 @@ if (stripos(trim($sql), 'update') === 0) {
 | **自定义函数** | `log.diff(a, b)` | `DATEDIFF(...)` |
 | **from_timestamp** | `from_timestamp(x, 'fmt')` | `date_format(x, 'fmt')` ← 直接替换 |
 | **日期截断** | `trunc(x, 'MONTH')` | `date_trunc(x, 'month')` ← 函数名不同，单位小写 |
-| **year(x)** | `year(from_unixtime(unix_timestamp(cast(x as string),'%Y%m%d'),'%Y-%m-%d'))` | `year(cast(x as date))` |
-| **weekofyear(x)** | `weekofyear(from_unixtime(unix_timestamp(cast(x as string),'%Y%m%d'),'%Y-%m-%d'))` | `weekofyear(cast(x as date))` |
+| **year(x)** | `year(from_unixtime(unix_timestamp(cast(x as string),'%Y%m%d'),'%Y-%m-%d'))` | 保留原链不变（仅替换格式串）。⛔ **不要简化成 `year(cast(x as date))`** —— 当 `x` 是 INT YYYYMMDD 时返回 NULL，详见 §3.6 |
+| **weekofyear(x)** | `weekofyear(from_unixtime(unix_timestamp(cast(x as string),'%Y%m%d'),'%Y-%m-%d'))` | 同上，保留原链 |
 | **now()** | `now()` | `now()`（相同） |
 | **日期加减** | `date_add(x, -N)` | `date_add(x, interval -N day)` |
 | **月份差** | `months_between(a, b)` | `timestampdiff(MONTH, b, a)` ← **参数顺序反转** |
@@ -251,7 +251,7 @@ GROUP BY cday          -- 实际按天分组，不是按月
 GROUP BY date_trunc(cast(cday as date), 'month')
 ```
 
-### 3.6 year/weekofyear 链简化
+### 3.6 year/weekofyear 链简化（⚠️ 默认不要简化）
 
 Impala 中常见模式是将 YYYYMMDD 格式 int 先 cast 成 string，再解析成 timestamp，再取 year/week。
 
@@ -259,15 +259,58 @@ Impala 中常见模式是将 YYYYMMDD 格式 int 先 cast 成 string，再解析
 -- Impala（复杂链）
 year(from_unixtime(unix_timestamp(cast(a.cday as string),'%Y%m%d'),'%Y-%m-%d'))
 weekofyear(from_unixtime(unix_timestamp(cast(a.cday as string),'%Y%m%d'),'%Y-%m-%d'))
-
--- Doris(直接简化)
-year(cast(a.cday as date))
-weekofyear(cast(a.cday as date))
 ```
 
-> Doris 的 `cast(int as date)` 能识别 YYYYMMDD 格式整数（例如 20240301 → 2024-03-01）。
+> ## ⛔ 实测结论：`cast(int as date)` 在 Doris 返回 NULL
 >
-> **⚠️ 注意 NULL/异常值：** 如果 `cday` 可能存在不是合法 8 位日期的值（例如 0、20240230、1900000、NULL），`cast as date` 会返回 NULL，导致 `year()`/`weekofyear()` 也返回 NULL。如果原 Impala SQL 在外层依赖 `is null` 判断，请确认行为一致；必要时保留 `from_unixtime(unix_timestamp(...))` 链以保持容错。
+> 经多个项目实测确认，Doris **不支持**直接 `cast(int as date)`：
+>
+> ```sql
+> select cast(20260101 as date);
+> -- 输出：NULL（无报错，静默失败）
+> ```
+>
+> **这意味着：如果源列 `cday` 是 INT 类型 YYYYMMDD（最常见的情况），直接写 `year(cast(cday as date))` 会得到 `year(NULL) = NULL`，所有 WHERE / GROUP BY 条件全部失效，但 SQL 不会报错。**
+>
+> 这是一个**静默坑**——你看不到任何异常信息，只是查询结果空了。
+
+#### 3.6.1 推荐做法：保留原链，不要简化
+
+**当源列是 INT 类型时（最常见），保留 Impala 原链不变就是正确做法：**
+
+```sql
+-- Doris（INT 源列，保留原链，已经合法）
+year(from_unixtime(unix_timestamp(cast(a.cday as string),'%Y%m%d'),'%Y-%m-%d'))
+weekofyear(from_unixtime(unix_timestamp(cast(a.cday as string),'%Y%m%d'),'%Y-%m-%d'))
+```
+
+只要把内层格式串从 `'yyyyMMdd'`/`'yyyy-MM-dd'` 改成 `'%Y%m%d'`/`'%Y-%m-%d'`，整条链在 Doris 里能跑通。**冗长但正确**，不要为了"美观"动它。
+
+#### 3.6.2 仅在源列已是 DATE/DATETIME 类型时才简化
+
+```sql
+-- ✅ 安全：源列就是 DATE 类型
+year(cday)
+weekofyear(cday)
+
+-- ✅ 安全：源列是 'YYYY-MM-DD' 格式 STRING
+year(cast(cday as date))
+weekofyear(cast(cday as date))
+
+-- ⛔ 错误：源列是 INT (YYYYMMDD)
+year(cast(cday as date))   -- 全部返回 NULL，结果集异常
+```
+
+#### 3.6.3 如果一定要从 INT 简化（不推荐）
+
+只有在确认全表 `cday` 都是合法 8 位日期、且性能瓶颈确实在那条嵌套链上时，才考虑：
+
+```sql
+year(to_date(cast(cday as string), '%Y%m%d'))
+weekofyear(to_date(cast(cday as string), '%Y%m%d'))
+```
+
+但相比保留原链，没有实质收益，且引入了一个新坑（如果 `to_date` 在你的 Doris 版本里行为不同）。**默认推荐保留原链。**
 
 ### 3.7 复杂日期计算链
 
@@ -278,15 +321,38 @@ cast(from_unixtime(unix_timestamp(date_add(
 )), 'yyyyMMdd') as int)
 ```
 
-**Doris（简化写法）：**
+#### 3.7.1 ✅ 推荐：仅替换格式串和 `date_add` 语法，保留嵌套结构
+
 ```sql
+cast(from_unixtime(unix_timestamp(date_add(
+    from_unixtime(unix_timestamp(cast(b.cday as string),'%Y%m%d'),'%Y-%m-%d'),
+    interval -1 day
+)), '%Y%m%d') as int)
+```
+
+只改了两处：
+- `'yyyyMMdd'` / `'yyyy-MM-dd'` → `'%Y%m%d'` / `'%Y-%m-%d'`
+- `date_add(..., -1)` → `date_add(..., interval -1 day)`
+
+**这是默认推荐做法**——结构冗长但语义无损，对 INT YYYYMMDD 类型的 `b.cday` 安全。
+
+#### 3.7.2 ⚠️ 谨慎：进一步简化（仅在 `b.cday` 是 DATE 类型时安全）
+
+```sql
+-- ⛔ 当 b.cday 是 INT YYYYMMDD 时：返回 NULL（cast(int as date) 失败）
 cast(date_format(date_add(cast(b.cday as date), interval -1 day), '%Y%m%d') as int)
 ```
 
-或者如果结果就是减一天后的 cday：
+参见 §3.6 的实测结论。除非你已经确认 `b.cday` 是 DATE 类型，否则不要这样简化。
+
+#### 3.7.3 ⚠️ 极度谨慎：算术减一
+
+如果你能确认结果只用作"前一天的 cday"且**永远不跨月、不跨年、不跨闰年边界**，可以：
 ```sql
 b.cday - 1
 ```
+
+但 `20260301 - 1 = 20260300`（非法日期），所以**只在 `b.cday` 永远不是月初时才能这样写**。生产代码里**强烈不推荐**——大概率埋雷。
 
 ### 3.8 from_timestamp(trunc(...), 'fmt') 完整链
 
@@ -295,15 +361,19 @@ b.cday - 1
 cast(from_timestamp(trunc(from_unixtime(unix_timestamp(cast(cday as string),'%Y%m%d'),'%Y-%m-%d'),'DAY'),'%Y%m%d') as int)
 ```
 
-**Doris：**
+**Doris（推荐：保留嵌套，只换函数名 + 单位小写）：**
 ```sql
-cast(date_format(date_trunc(cast(cday as date), 'day'), '%Y%m%d') as int)
+cast(date_format(date_trunc(
+    from_unixtime(unix_timestamp(cast(cday as string),'%Y%m%d'),'%Y-%m-%d'),
+    'day'
+), '%Y%m%d') as int)
 ```
 
-进一步简化（截断到天对 date 是空操作）：
-```sql
-cast(date_format(cast(cday as date), '%Y%m%d') as int)
-```
+只改：
+- `from_timestamp(...)` → `date_format(...)`
+- `trunc(..., 'DAY')` → `date_trunc(..., 'day')`（单位小写）
+
+> ⚠️ **不要简化成 `cast(cday as date)`**：当 `cday` 是 INT YYYYMMDD 时，返回 NULL（参见 §3.6 实测结论）。**仅在 `cday` 是 DATE 类型时**才能简化为 `cast(date_format(cast(cday as date), '%Y%m%d') as int)`。
 
 ### 3.8.1 months_between → timestampdiff（参数顺序反转）
 
@@ -824,6 +894,22 @@ date_add(cast(b.cday as date), interval -7 day)
 
 ⚠️ 把下方 `<TARGET>` 替换为实际迁移目录（如 `your_project/include/units/`）。
 
+### 5.0 命中后的二次判断（必读）
+
+grep 是字面匹配，**不区分代码、注释、字符串字面量**。命中输出非空时，**必须人工核对每一条**，按下表分类：
+
+| 命中位置 | 处理 |
+|---------|------|
+| ✅ 真正的可执行 PHP/SQL 代码 | 必须修改 |
+| 🟡 `/* ... */` 块注释里 | 一般无害（如开发者保留的命令行备忘）；如担心误导后人，可一并删掉 |
+| 🟡 `//` 或 `#` 行注释里 | 同上 |
+| 🟡 字符串字面量内容（如 echo 日志 / 文档字符串） | 看是否会被作为 SQL 执行；只是日志文本则无害 |
+| 🟡 `tests/` / `test*.php` 等非生产路径 | 优先级低；只要生产代码干净，测试脚本可后续清理 |
+
+**判断流程**：grep 命中 → 逐条查看上下文 → 确认是上面 5 类哪一类 → 决定改 / 不改 / 后续改。
+
+> 真实案例：自检时 `grep "impala-shell"` 命中 3 个 `test*.php`，逐条看后发现都在 `/* ... */` 注释块里，是开发者的命令行备忘，**判定无害**，不改。
+
 ### 5.1 Impala 残留语法
 
 ```bash
@@ -915,8 +1001,8 @@ grep -rEn "set enable_unique_key_partial_update" <TARGET>
    - `'dd'`        → `'%d'`（注意只改格式串，避免误伤变量名）
    - `'HH:mm:ss'`  → `'%H:%i:%s'`
 10. 全局搜索 `trunc(X, 'UNIT')` → `date_trunc(X, 'unit')`（**注意 GROUP BY / 别名也要改**）
-11. 全局搜索 `year(from_unixtime(unix_timestamp(cast(` → `year(cast(X as date))`
-12. 全局搜索 `weekofyear(from_unixtime(unix_timestamp(cast(` → `weekofyear(cast(X as date))`
+11. **`year(from_unixtime(...))` 链** → 默认**保留原链不变**，仅替换内层格式串（参见 §3.6）。⛔ **不要**简化成 `year(cast(X as date))` —— 当 X 是 INT YYYYMMDD 时静默返回 NULL
+12. **`weekofyear(from_unixtime(...))` 链** → 同上，保留原链
 13. 全局搜索 `months_between(a, b)` → `timestampdiff(MONTH, b, a)`（**参数顺序反转**）
 14. 全局搜索 `date_add(X, -N)` / `date_add(X, $var)` → `date_add(X, interval -N day)` / `date_add(X, interval $var day)`
 15. **逗号 JOIN 转换** → `from a, b where a.id=b.id` 转为 `from a join b on a.id=b.id`
